@@ -1,0 +1,340 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+contract CrumbsVaultV2 is
+    Initializable,
+    Ownable2StepUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    // ===== Core State =====
+    address public vaultReceiver;
+    address[] public farmingWallets;
+    uint256 public maxWithdrawLimit; // 0 = no cap
+    uint256 public lastRotationTimestamp;
+    uint256 public rotationInterval; // seconds
+    address public latestWallet;
+
+    // ===== Governance / Versioning =====
+    string public versionTag;
+
+    // ===== Toggles =====
+    bool public promoEnabled;
+    bool public farmingEnabled;
+
+    // ===== Multisig (lightweight) =====
+    address[] public multisigApprovers;
+    mapping(bytes32 => uint256) public proposalVotes;
+    uint256 public multisigNonce;
+    uint256 public minApprovals; // set by owner
+    mapping(bytes32 => bool) public executed;
+    mapping(bytes32 => mapping(address => bool)) public approvedBy;
+
+    // ===== Bot Registry =====
+    enum BotRole { None, Admin, Farming, Promo, Trader }
+    struct Bot {
+        BotRole role;
+        bool active;
+        uint64 cooldown;
+        uint64 lastRun;
+        string botType;
+    }
+    mapping(address => Bot) public bots;
+
+    // ===== Events =====
+    event VersionTagged(string indexed tag);
+    event ToggleUpdated(string indexed feature, bool enabled);
+
+    event WalletRotated(address indexed oldWallet, address indexed newWallet);
+    event Deposited(address indexed sender, uint256 amount);
+    event EmergencyWithdraw(address indexed user, uint256 amount);
+    event TokenDrained(address indexed token, uint256 amount);
+
+    event BotRegistered(address indexed bot, BotRole role, string botType, uint256 cooldown, bool active);
+    event BotStatusUpdated(address indexed bot, bool active, uint256 cooldown);
+    event BotExecuted(address indexed bot, BotRole role, bytes4 indexed selector, uint256 timestamp);
+
+    event MultisigActionProposed(bytes32 indexed proposalId, address target);
+    event MultisigActionExecuted(bytes32 indexed proposalId, address target);
+    event MultisigThresholdUpdated(uint256 minApprovals);
+
+    event Staked(address indexed stakingContract, address indexed token, uint256 amount);
+    event Unstaked(address indexed stakingContract, address indexed token, uint256 amount);
+    event RewardsHarvested(address indexed stakingContract, uint256 amount);
+    event LiquidityProvided(address indexed router, address indexed tokenA, address indexed tokenB, uint256 amountA, uint256 amountB);
+
+    // ===== Modifiers =====
+    modifier onlyBotRole(BotRole required) {
+        Bot storage b = bots[msg.sender];
+        require(b.active, "Bot inactive");
+        require(b.role == required, "Wrong bot role");
+        require(block.timestamp >= uint256(b.lastRun) + uint256(b.cooldown), "Bot cooldown");
+        _;
+        b.lastRun = uint64(block.timestamp);
+        emit BotExecuted(msg.sender, b.role, msg.sig, block.timestamp);
+    }
+
+    // ===== Initializer =====
+    function initialize(
+        address _initialOwner,
+        address _vaultReceiver,
+        uint256 _maxWithdrawLimit
+    ) public initializer {
+        __Ownable2Step_init();      // no args
+        __ReentrancyGuard_init();
+        __Pausable_init();
+
+        _transferOwnership(_initialOwner); // explicit owner set
+
+        require(_vaultReceiver != address(0), "vaultReceiver zero");
+        vaultReceiver = _vaultReceiver;
+        maxWithdrawLimit = _maxWithdrawLimit; // 0 = no cap
+        rotationInterval = 3600; // default 1 hour
+        versionTag = "v2.3-root";
+        promoEnabled = true;
+        farmingEnabled = true;
+    }
+
+    // ===== Deposits =====
+    function deposit() external payable whenNotPaused {
+        require(msg.value > 0, "No ETH");
+        emit Deposited(msg.sender, msg.value);
+    }
+
+    // ===== Rotation =====
+    function rotateWallet() external onlyOwner {
+        require(farmingWallets.length > 0, "No wallets");
+        // Deterministic round-robin based on interval
+        uint256 index = (block.timestamp / rotationInterval) % farmingWallets.length;
+        address newWallet = farmingWallets[index];
+        require(newWallet != address(0), "Zero wallet");
+        emit WalletRotated(latestWallet, newWallet);
+        latestWallet = newWallet;
+        vaultReceiver = newWallet;
+        lastRotationTimestamp = block.timestamp;
+    }
+
+    function setVaultReceiver(address newReceiver) external onlyOwner {
+        require(newReceiver != address(0), "Zero address");
+        address old = vaultReceiver;
+        vaultReceiver = newReceiver;
+        emit WalletRotated(old, newReceiver);
+    }
+
+    // ===== Toggles =====
+    function setPromoEnabled(bool enabled) external onlyOwner {
+        promoEnabled = enabled;
+        emit ToggleUpdated("promo", enabled);
+    }
+
+    function setFarmingEnabled(bool enabled) external onlyOwner {
+        farmingEnabled = enabled;
+        emit ToggleUpdated("farming", enabled);
+    }
+
+    function setVersionTag(string calldata tag) external onlyOwner {
+        versionTag = tag;
+        emit VersionTagged(tag);
+    }
+
+    // ===== Bot Registry Management =====
+    function registerBot(
+        address bot,
+        BotRole role,
+        string memory botType,
+        uint256 cooldown,
+        bool active
+    ) external onlyOwner {
+        require(bot != address(0), "Bot zero");
+        require(cooldown <= type(uint64).max, "Cooldown too large");
+        bots[bot] = Bot(role, active, uint64(cooldown), 0, botType);
+        emit BotRegistered(bot, role, botType, cooldown, active);
+    }
+
+    function setBotStatus(address bot, bool active, uint256 cooldown) external onlyOwner {
+        Bot storage b = bots[bot];
+        require(b.role != BotRole.None, "Bot not registered");
+        require(cooldown <= type(uint64).max, "Cooldown too large");
+        b.active = active;
+        b.cooldown = uint64(cooldown);
+        emit BotStatusUpdated(bot, active, cooldown);
+    }
+
+    // ===== Multisig Proposal Execution =====
+    function setMultisigThreshold(uint256 threshold) external onlyOwner {
+        require(threshold > 0, "Threshold zero");
+        minApprovals = threshold;
+        emit MultisigThresholdUpdated(threshold);
+    }
+
+    function addApprover(address approver) external onlyOwner {
+        require(approver != address(0), "Zero approver");
+        require(!isApprover(approver), "Already approver");
+        multisigApprovers.push(approver);
+    }
+
+    function removeApprover(address approver) external onlyOwner {
+        require(isApprover(approver), "Not approver");
+        uint256 len = multisigApprovers.length;
+        for (uint256 i = 0; i < len; ) {
+            if (multisigApprovers[i] == approver) {
+                multisigApprovers[i] = multisigApprovers[len - 1];
+                multisigApprovers.pop();
+                break;
+            }
+            unchecked { ++i; }
+        }
+    }
+
+    function proposeMultisigAction(address target, bytes memory data) external {
+        require(isApprover(msg.sender), "Not approver");
+        bytes32 proposalId = keccak256(abi.encode(target, data, multisigNonce));
+        require(!executed[proposalId], "Already executed");
+        require(!approvedBy[proposalId][msg.sender], "Already approved");
+
+        approvedBy[proposalId][msg.sender] = true;
+        proposalVotes[proposalId] += 1;
+        emit MultisigActionProposed(proposalId, target);
+
+        if (proposalVotes[proposalId] >= minApprovals) {
+            executed[proposalId] = true;
+            unchecked { ++multisigNonce; }
+            (bool success, ) = target.call(data);
+            require(success, "Execution failed");
+            emit MultisigActionExecuted(proposalId, target);
+        }
+    }
+
+    function isApprover(address addr) internal view returns (bool) {
+        uint256 len = multisigApprovers.length;
+        for (uint256 i = 0; i < len; ) {
+            if (multisigApprovers[i] == addr) return true;
+            unchecked { ++i; }
+        }
+        return false;
+    }
+
+    // ===== Emergency & Withdraw Limits =====
+    function emergencyWithdraw() external nonReentrant whenPaused onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No ETH");
+        require(balance <= maxWithdrawLimit || maxWithdrawLimit == 0, "Exceeds max limit");
+        (bool ok, ) = payable(msg.sender).call{value: balance}("");
+        require(ok, "ETH send failed");
+        emit EmergencyWithdraw(msg.sender, balance);
+    }
+
+    function drainERC20(address token) external onlyOwner nonReentrant {
+        uint256 balance = IERC20Upgradeable(token).balanceOf(address(this));
+        require(balance > 0, "No tokens");
+        require(balance <= maxWithdrawLimit || maxWithdrawLimit == 0, "Exceeds max limit");
+        IERC20Upgradeable(token).safeTransfer(vaultReceiver, balance);
+        emit TokenDrained(token, balance);
+    }
+
+    // ===== ABI-Decoded Integration Hooks =====
+    // Staking: approve + stake(uint256) call on external staking contract
+    function botVaultStake(bytes calldata payload)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyBotRole(BotRole.Farming)
+    {
+        require(farmingEnabled, "Farming disabled");
+        (address stakingContract, address token, uint256 amount) =
+            abi.decode(payload, (address, address, uint256));
+        require(stakingContract != address(0) && token != address(0), "Bad addresses");
+        IERC20Upgradeable(token).safeIncreaseAllowance(stakingContract, amount);
+        (bool ok, ) = stakingContract.call(abi.encodeWithSignature("stake(uint256)", amount));
+        require(ok, "Stake failed");
+        emit Staked(stakingContract, token, amount);
+    }
+
+    // Unstake via provided callData (e.g., unstake(uint256))
+    function botVaultUnstake(bytes calldata payload)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyBotRole(BotRole.Farming)
+    {
+        require(farmingEnabled, "Farming disabled");
+        (address stakingContract, address token, uint256 amount, bytes memory callData) =
+            abi.decode(payload, (address, address, uint256, bytes));
+        require(stakingContract != address(0) && token != address(0), "Bad addresses");
+        (bool ok, ) = stakingContract.call(callData);
+        require(ok, "Unstake failed");
+        emit Unstaked(stakingContract, token, amount);
+    }
+
+    // Harvest rewards (amount optional; can be parsed from logs if needed)
+    function botVaultHarvest(bytes calldata payload)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyBotRole(BotRole.Farming)
+    {
+        require(farmingEnabled, "Farming disabled");
+        (address stakingContract, bytes memory callData) = abi.decode(payload, (address, bytes));
+        require(stakingContract != address(0), "Bad staking contract");
+        (bool ok, ) = stakingContract.call(callData);
+        require(ok, "Harvest failed");
+        emit RewardsHarvested(stakingContract, 0);
+    }
+
+    // Promo disbursement: ETH or ERC20
+    function botPromoDisburse(bytes calldata payload)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyBotRole(BotRole.Promo)
+    {
+        require(promoEnabled, "Promo disabled");
+        (address token, address to, uint256 amount) = abi.decode(payload, (address, address, uint256));
+        require(to != address(0), "Bad recipient");
+
+        if (token == address(0)) {
+            require(amount <= address(this).balance, "Insufficient ETH");
+            require(amount <= maxWithdrawLimit || maxWithdrawLimit == 0, "Exceeds max limit");
+            (bool ok, ) = payable(to).call{value: amount}("");
+            require(ok, "ETH send failed");
+        } else {
+            require(amount <= IERC20Upgradeable(token).balanceOf(address(this)), "Insufficient tokens");
+            require(amount <= maxWithdrawLimit || maxWithdrawLimit == 0, "Exceeds max limit");
+            IERC20Upgradeable(token).safeTransfer(to, amount);
+        }
+    }
+
+    // Provide liquidity via router callData (e.g., addLiquidity)
+    function botProvideLiquidity(bytes calldata payload)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyBotRole(BotRole.Trader)
+    {
+        require(farmingEnabled, "Farming disabled"); // split into separate toggle if preferred
+        (address router, address tokenA, address tokenB, uint256 amountA, uint256 amountB, bytes memory callData) =
+            abi.decode(payload, (address, address, address, uint256, uint256, bytes));
+        require(router != address(0) && tokenA != address(0) && tokenB != address(0), "Bad addresses");
+
+        IERC20Upgradeable(tokenA).safeIncreaseAllowance(router, amountA);
+        IERC20Upgradeable(tokenB).safeIncreaseAllowance(router, amountB);
+
+        (bool ok, ) = router.call(callData);
+        require(ok, "Provide liquidity failed");
+
+        emit LiquidityProvided(router, tokenA, tokenB, amountA, amountB);
+    }
+
+    // ===== Pause Controls =====
+    function pauseVault() external onlyOwner { _pause(); }
+    function unpauseVault() external onlyOwner { _unpause(); }
+}
